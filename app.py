@@ -31,7 +31,6 @@ client_mongo = AsyncIOMotorClient(MONGO_URL)
 db = client_mongo["premium_bot"]
 premium_col = db["premium_users"]
 stats_col = db["user_stats"]
-sessions_col = db["sessions"]
 
 # Pyrogram Bot
 bot = Client("premium_bot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
@@ -153,6 +152,23 @@ async def create_zip(source_dir, zip_path):
                 arcname = os.path.relpath(file_path, source_dir)
                 zipf.write(file_path, arcname)
 
+def parse_image_name(text):
+    """Parse image name from various inputs"""
+    text = text.strip()
+    
+    # Check if it's a Docker Hub URL
+    url_pattern = r'https?://hub\.docker\.com/r/([^/]+)/([^/]+)'
+    match = re.match(url_pattern, text)
+    if match:
+        return f"{match.group(1)}/{match.group(2)}:latest"
+    
+    # Check if it's username/repo:tag format
+    if '/' in text or ':' in text:
+        return text
+    
+    # Default to library/image
+    return f"library/{text}:latest"
+
 # ============ Flask Routes ============
 @app.route('/')
 def home():
@@ -229,9 +245,15 @@ async def cancel_command(client, message: Message):
         user_state[user_id] = {"step": None, "image": None}
     await message.reply_text("✅ Cancelled. Use /extract to start again.")
 
-@bot.on_message(filters.text & ~filters.command)
+# FIXED: Text handler without the ~ operator
+@bot.on_message(filters.text)
 async def handle_text_input(client, message: Message):
     user_id = message.from_user.id
+    
+    # Ignore commands (they are handled separately)
+    if message.text.startswith('/'):
+        return
+    
     text = message.text.strip()
     
     # Check if waiting for image
@@ -492,29 +514,11 @@ async def callback_handler(client, callback_query):
     data = callback_query.data
     
     if data == "start_extract":
-        # Trigger extract command
         await extract_command(client, callback_query.message)
     elif data == "buy":
         await upi_command(client, callback_query.message)
     
     await callback_query.answer()
-
-def parse_image_name(text):
-    """Parse image name from various inputs"""
-    text = text.strip()
-    
-    # Check if it's a Docker Hub URL
-    url_pattern = r'https?://hub\.docker\.com/r/([^/]+)/([^/]+)'
-    match = re.match(url_pattern, text)
-    if match:
-        return f"{match.group(1)}/{match.group(2)}:latest"
-    
-    # Check if it's username/repo:tag format
-    if '/' in text or ':' in text:
-        return text
-    
-    # Default to library/image
-    return f"library/{text}:latest"
 
 # ============ Run ============
 def run_flask():
