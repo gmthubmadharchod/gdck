@@ -1,7 +1,4 @@
 import os
-import subprocess
-import shutil
-import zipfile
 import asyncio
 import threading
 import re
@@ -11,6 +8,7 @@ from pyrogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton
 from datetime import datetime, timedelta
 from motor.motor_asyncio import AsyncIOMotorClient
 import qrcode
+from docker_handler import DockerExtractor
 
 # ============ CONFIG ============
 API_ID = int(os.getenv("API_ID"))
@@ -21,7 +19,6 @@ OWNER_ID = int(os.getenv("OWNER_ID"))
 OWNER_USERNAME = os.getenv("OWNER_USERNAME", "owner")
 UPI_ID = os.getenv("UPI_ID", "owner@ybl")
 PORT = int(os.getenv("PORT", 8080))
-TEMP_DIR = "/tmp/docker_extract"
 # ================================
 
 app = Flask(__name__)
@@ -32,11 +29,14 @@ db = client_mongo["premium_bot"]
 premium_col = db["premium_users"]
 stats_col = db["user_stats"]
 
+# Docker Handler
+docker = DockerExtractor()
+
 # Pyrogram Bot
 bot = Client("premium_bot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
 
-# Store user session state
-user_state = {}
+# User session
+user_session = {}
 
 # ============ Database Functions ============
 async def is_premium(user_id):
@@ -69,89 +69,6 @@ def format_size(size):
     else:
         return f"{size/(1024*1024):.2f} MB"
 
-# ============ Docker Extraction ============
-async def extract_docker_image(image_name, status_msg=None):
-    safe_name = image_name.replace('/', '_').replace(':', '_')
-    temp_dir = f"{TEMP_DIR}/{safe_name}"
-    
-    if os.path.exists(temp_dir):
-        shutil.rmtree(temp_dir)
-    os.makedirs(temp_dir, exist_ok=True)
-    
-    try:
-        if status_msg:
-            await status_msg.edit_text(f"🔄 Pulling {image_name}...")
-        
-        proc = await asyncio.create_subprocess_shell(
-            f"docker pull {image_name}",
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE
-        )
-        await proc.communicate()
-        
-        if status_msg:
-            await status_msg.edit_text(f"📦 Creating container...")
-        
-        proc = await asyncio.create_subprocess_shell(
-            f"docker create {image_name}",
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-            text=True
-        )
-        stdout, _ = await proc.communicate()
-        container_id = stdout.strip()
-        
-        if status_msg:
-            await status_msg.edit_text(f"📂 Exporting filesystem...")
-        
-        export_tar = f"{temp_dir}/export.tar"
-        await asyncio.create_subprocess_shell(
-            f"docker export {container_id} -o {export_tar}",
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE
-        )
-        
-        if status_msg:
-            await status_msg.edit_text(f"📁 Extracting files...")
-        
-        files_dir = f"{temp_dir}/files"
-        os.makedirs(files_dir, exist_ok=True)
-        await asyncio.create_subprocess_shell(
-            f"tar -xf {export_tar} -C {files_dir} 2>/dev/null",
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE
-        )
-        
-        await asyncio.create_subprocess_shell(f"docker rm {container_id}")
-        
-        total = 0
-        for _, _, files in os.walk(files_dir):
-            total += len(files)
-        
-        return files_dir, temp_dir, total
-        
-    except Exception as e:
-        print(f"Extract error: {e}")
-        return None, None, 0
-
-def get_all_files(directory):
-    files = []
-    for root, _, filenames in os.walk(directory):
-        for f in filenames:
-            full = os.path.join(root, f)
-            rel = os.path.relpath(full, directory)
-            size = os.path.getsize(full)
-            files.append({"name": rel, "size": size, "path": full})
-    return files
-
-async def create_zip(source_dir, zip_path):
-    with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as zipf:
-        for root, _, files in os.walk(source_dir):
-            for file in files:
-                file_path = os.path.join(root, file)
-                arcname = os.path.relpath(file_path, source_dir)
-                zipf.write(file_path, arcname)
-
 def parse_image_name(text):
     text = text.strip()
     url_pattern = r'https?://hub\.docker\.com/r/([^/]+)/([^/]+)'
@@ -171,228 +88,54 @@ def home():
 def health():
     return jsonify({"status": "healthy"}), 200
 
-# ============ Telegram Bot Commands ============
+# ============ Bot Commands ============
 
 @bot.on_message(filters.command("start"))
 async def start_command(client, message: Message):
     user_id = message.from_user.id
     premium = await is_premium(user_id)
     
-    user_state[user_id] = {"step": None, "image": None}
-    
     text = f"""🔥 Docker Image Extractor Bot
 
 Hi {message.from_user.first_name}!
 
-How to use:
-1️⃣ Send /extract command
-2️⃣ Bot will ask for image name/URL
-3️⃣ Send image (like: ubuntu:latest)
-4️⃣ Then use /zip or /files
-
 Commands:
-/extract - Start extraction process
-/zip - Download as ZIP
+/zip - Extract image to ZIP
 /files - Get file list
-/tree - Show folder structure
-/premium - Check status
 /upi - Payment info
+/premium - Check status
 /profile - Your stats
 
 Status: {'✨ Premium' if premium else '⭐ Free'}"""
     
     buttons = InlineKeyboardMarkup([
-        [InlineKeyboardButton("🚀 Start Extraction", callback_data="start_extract")],
         [InlineKeyboardButton("📦 Buy Premium", callback_data="buy")]
     ])
     
     await message.reply_text(text, reply_markup=buttons)
 
-@bot.on_message(filters.command("extract"))
-async def extract_command(client, message: Message):
-    user_id = message.from_user.id
-    
-    user_state[user_id] = {"step": "waiting_for_image", "image": None}
-    
-    text = """🔍 Send me the Docker image
-
-Examples:
-• ubuntu:latest
-• nginx:alpine
-• python:3.9
-• library/redis
-
-Or Docker Hub URL:
-• https://hub.docker.com/r/library/ubuntu
-
-Send the image name/URL now..."""
-    
-    await message.reply_text(text)
-
-@bot.on_message(filters.command("cancel"))
-async def cancel_command(client, message: Message):
-    user_id = message.from_user.id
-    if user_id in user_state:
-        user_state[user_id] = {"step": None, "image": None}
-    await message.reply_text("✅ Cancelled. Use /extract to start again.")
-
-@bot.on_message(filters.text)
-async def handle_text_input(client, message: Message):
-    user_id = message.from_user.id
-    
-    if message.text.startswith('/'):
-        return
-    
-    text = message.text.strip()
-    
-    if user_id in user_state and user_state[user_id].get("step") == "waiting_for_image":
-        image_name = parse_image_name(text)
-        user_state[user_id]["image"] = image_name
-        user_state[user_id]["step"] = "image_ready"
-        
-        await message.reply_text(
-            f"✅ Image saved: {image_name}\n\n"
-            f"Now use these commands:\n"
-            f"• /zip - Download all files as ZIP\n"
-            f"• /files - Get list of all files\n"
-            f"• /tree - Show folder structure\n\n"
-            f"Or send /extract again for new image"
-        )
-        return
-    
-    await message.reply_text("❌ Use /extract first to set an image!")
-
 @bot.on_message(filters.command("zip"))
 async def zip_command(client, message: Message):
     user_id = message.from_user.id
-    
-    if user_id not in user_state or not user_state[user_id].get("image"):
-        await message.reply_text("❌ No image set!\n\nUse /extract first to set a Docker image.")
-        return
-    
-    image_name = user_state[user_id]["image"]
-    status = await message.reply_text(f"🔄 Processing {image_name}...\n⏳ This may take 1-3 minutes")
-    
-    files_dir, temp_dir, total = await extract_docker_image(image_name, status)
-    
-    if not files_dir:
-        await status.edit_text(f"❌ Failed to extract {image_name}\n\nMake sure the image exists.")
-        return
-    
-    await status.edit_text(f"✅ Found {total} files!\n📦 Creating ZIP...")
-    
-    zip_name = image_name.replace('/', '_').replace(':', '_')
-    zip_path = f"{TEMP_DIR}/{zip_name}.zip"
-    await create_zip(files_dir, zip_path)
-    
-    zip_size = os.path.getsize(zip_path)
-    await status.edit_text(f"📤 Sending ZIP ({total} files, {format_size(zip_size)})...")
-    
-    await message.reply_document(
-        document=zip_path,
-        caption=f"📦 Image: {image_name}\n📄 Files: {total}\n💾 Size: {format_size(zip_size)}",
-        file_name=f"{zip_name}.zip"
+    user_session[user_id] = {"action": "zip", "waiting": True}
+    await message.reply_text(
+        "🔍 Send me the Docker image name/URL\n\n"
+        "Examples:\n"
+        "• ubuntu:latest\n"
+        "• nginx:alpine\n"
+        "• https://hub.docker.com/r/library/ubuntu"
     )
-    
-    shutil.rmtree(temp_dir, ignore_errors=True)
-    if os.path.exists(zip_path):
-        os.remove(zip_path)
-    await status.delete()
-    
-    await update_stats(user_id, "zips")
 
 @bot.on_message(filters.command("files"))
 async def files_command(client, message: Message):
     user_id = message.from_user.id
-    
-    if user_id not in user_state or not user_state[user_id].get("image"):
-        await message.reply_text("❌ No image set!\n\nUse /extract first to set a Docker image.")
-        return
-    
-    image_name = user_state[user_id]["image"]
-    status = await message.reply_text(f"🔄 Processing {image_name}...")
-    
-    files_dir, temp_dir, total = await extract_docker_image(image_name, status)
-    
-    if not files_dir:
-        await status.edit_text(f"❌ Failed to extract {image_name}")
-        return
-    
-    all_files = get_all_files(files_dir)
-    
-    await status.edit_text(f"✅ Found {total} files!\n📝 Sending file list...")
-    
-    batch = []
-    for i, f in enumerate(all_files[:500], 1):
-        batch.append(f"📄 {f['name']} - {format_size(f['size'])}")
-        
-        if len(batch) >= 50:
-            await message.reply_text("\n".join(batch))
-            batch = []
-            await asyncio.sleep(0.3)
-    
-    if batch:
-        await message.reply_text("\n".join(batch))
-    
-    if total > 500:
-        await message.reply_text(f"⚠️ Showing first 500 of {total} files. Use /zip to download all.")
-    
-    shutil.rmtree(temp_dir, ignore_errors=True)
-    await status.delete()
-
-@bot.on_message(filters.command("tree"))
-async def tree_command(client, message: Message):
-    user_id = message.from_user.id
-    
-    if user_id not in user_state or not user_state[user_id].get("image"):
-        await message.reply_text("❌ No image set!\n\nUse /extract first to set a Docker image.")
-        return
-    
-    image_name = user_state[user_id]["image"]
-    status = await message.reply_text(f"🔄 Analyzing {image_name}...")
-    
-    files_dir, temp_dir, total = await extract_docker_image(image_name, status)
-    
-    if not files_dir:
-        await status.edit_text(f"❌ Failed!")
-        return
-    
-    tree_lines = ["📁 Folder Structure\n"]
-    
-    def build_tree(path="", prefix=""):
-        lines = []
-        items = []
-        
-        full_path = os.path.join(files_dir, path) if path else files_dir
-        if os.path.exists(full_path):
-            for item in sorted(os.listdir(full_path)):
-                items.append(item)
-        
-        for i, item in enumerate(items):
-            item_path = os.path.join(path, item) if path else item
-            full_item = os.path.join(files_dir, item_path)
-            is_last = (i == len(items) - 1)
-            
-            if os.path.isdir(full_item):
-                lines.append(f"{prefix}{'└── ' if is_last else '├── '}📁 {item}/")
-                lines.extend(build_tree(item_path, prefix + ('    ' if is_last else '│   ')))
-            else:
-                size = os.path.getsize(full_item)
-                lines.append(f"{prefix}{'└── ' if is_last else '├── '}📄 {item} ({format_size(size)})")
-        
-        return lines
-    
-    tree_lines.extend(build_tree())
-    tree_lines.append(f"\n📊 Total: {total} files")
-    
-    tree_text = "\n".join(tree_lines)
-    if len(tree_text) > 4000:
-        tree_text = tree_text[:4000] + "\n\n... (truncated)"
-    
-    await message.reply_text(tree_text)
-    
-    shutil.rmtree(temp_dir, ignore_errors=True)
-    await status.delete()
+    user_session[user_id] = {"action": "files", "waiting": True}
+    await message.reply_text(
+        "🔍 Send me the Docker image name/URL\n\n"
+        "Examples:\n"
+        "• ubuntu:latest\n"
+        "• nginx:alpine"
+    )
 
 @bot.on_message(filters.command("premium"))
 async def premium_command(client, message: Message):
@@ -417,14 +160,7 @@ async def premium_command(client, message: Message):
         expiry = user['expiry'].strftime('%Y-%m-%d')
         await message.reply_text(f"✨ Premium Active\n📅 Expires: {expiry}")
     else:
-        await message.reply_text(
-            "⭐ Free User\n\n"
-            "Premium Benefits:\n"
-            "• Unlimited extractions\n"
-            "• Priority processing\n"
-            "• Larger file support\n\n"
-            "Use /upi to buy premium"
-        )
+        await message.reply_text("⭐ Free User\n\nUse /upi to buy premium")
 
 @bot.on_message(filters.command("profile"))
 async def profile_command(client, message: Message):
@@ -462,24 +198,78 @@ Plans:
 • 90 Days - ₹249
 • 365 Days - ₹799
 
-How to Pay:
-1. Scan QR code below
-2. Send payment
-3. Forward receipt to @{OWNER_USERNAME}
-
-You will be activated within 24 hours"""
+Pay and forward receipt to @{OWNER_USERNAME}"""
     
     await message.reply_photo(photo=qr_path, caption=text)
 
+# ============ Text Handler ============
+@bot.on_message(filters.text & ~filters.command)
+async def handle_image_input(client, message: Message):
+    user_id = message.from_user.id
+    text = message.text.strip()
+    
+    if user_id not in user_session or not user_session[user_id].get("waiting"):
+        await message.reply_text("❌ Use /zip or /files first!")
+        return
+    
+    action = user_session[user_id].get("action")
+    image_name = parse_image_name(text)
+    user_session[user_id] = {}
+    
+    status = await message.reply_text(f"🔄 Processing {image_name}...\n⏳ This may take 1-3 minutes")
+    
+    files_dir, temp_dir, total_files = await docker.extract_image(image_name, status)
+    
+    if not files_dir:
+        await status.edit_text(f"❌ Failed to extract {image_name}\n\nMake sure the image exists.")
+        return
+    
+    if action == "zip":
+        await status.edit_text(f"✅ Found {total_files} files!\n📦 Creating ZIP...")
+        
+        zip_name = image_name.replace('/', '_').replace(':', '_')
+        zip_path = f"/tmp/{zip_name}.zip"
+        await docker.create_zip(files_dir, zip_path)
+        
+        zip_size = os.path.getsize(zip_path)
+        await status.edit_text(f"📤 Sending ZIP ({total_files} files, {format_size(zip_size)})...")
+        
+        await message.reply_document(
+            document=zip_path,
+            caption=f"📦 Image: {image_name}\n📄 Files: {total_files}\n💾 Size: {format_size(zip_size)}",
+            file_name=f"{zip_name}.zip"
+        )
+        
+        await docker.cleanup(temp_dir, zip_path)
+        await status.delete()
+        await update_stats(user_id, "zips")
+    
+    elif action == "files":
+        await status.edit_text(f"✅ Found {total_files} files!\n📝 Sending file list...")
+        
+        all_files = docker.get_all_files(files_dir)
+        
+        batch = []
+        for f in all_files[:500]:
+            batch.append(f"📄 {f['name']} - {format_size(f['size'])}")
+            if len(batch) >= 50:
+                await message.reply_text("\n".join(batch))
+                batch = []
+                await asyncio.sleep(0.3)
+        
+        if batch:
+            await message.reply_text("\n".join(batch))
+        
+        if total_files > 500:
+            await message.reply_text(f"⚠️ Showing first 500 of {total_files} files. Use /zip to download all.")
+        
+        await docker.cleanup(temp_dir)
+        await status.delete()
+
 @bot.on_callback_query()
 async def callback_handler(client, callback_query):
-    data = callback_query.data
-    
-    if data == "start_extract":
-        await extract_command(client, callback_query.message)
-    elif data == "buy":
+    if callback_query.data == "buy":
         await upi_command(client, callback_query.message)
-    
     await callback_query.answer()
 
 # ============ Run ============
@@ -490,7 +280,7 @@ def run_bot():
     bot.run()
 
 if __name__ == "__main__":
-    os.makedirs(TEMP_DIR, exist_ok=True)
+    os.makedirs("/tmp/docker_extract", exist_ok=True)
     
     threading.Thread(target=run_flask, daemon=True).start()
     
